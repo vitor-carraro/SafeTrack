@@ -72,7 +72,7 @@ int main() {
     pthread_join(sensor_thread, NULL);
     pthread_join(network_thread, NULL);
 
-    // Destroi o mutex (não será alcançado neste exemplo)
+    // o mutex (não será alcançado neste exemplo)
     pthread_mutex_destroy(&data_mutex);
 
     return 0;
