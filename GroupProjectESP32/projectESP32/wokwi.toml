@@ -1,0 +1,5 @@
+[wokwi]
+rfc2217ServerPort = 4000
+version = 1
+firmware = 'C:/GitLab/repositorios-pessoais/SafeTrack/GroupProjectESP32/projectESP32/wifi.hex'
+elf = 'C:/GitLab/repositorios-pessoais/SafeTrack/GroupProjectESP32/projectESP32/wifi.elf'
