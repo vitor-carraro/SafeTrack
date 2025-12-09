@@ -154,12 +154,15 @@ void MqttTask(void *pv) {
       json += "}";
 
       mqtt.publish(TOPIC_SENSOR, json.c_str());
+      String logMsg;
+      while (popLog(logMsg)) {
+          mqtt.publish(TOPIC_LOG, logMsg.c_str());
+      }
       pushLog("MQTT enviado: " + json);
-
       mqtt.loop();
     }
 
-    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(100));
   }
 }
 
@@ -169,10 +172,6 @@ void LogTask(void *pv) {
       String msg;
       while (popLog(msg)) {
         Serial.println("[LOG] " + msg);
-
-        if (mqtt.connected()) {
-          mqtt.publish(TOPIC_LOG, msg.c_str());
-        }
       }
     }
   }
