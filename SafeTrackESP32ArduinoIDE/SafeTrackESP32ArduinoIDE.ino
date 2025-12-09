@@ -1,48 +1,77 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
 // ----------------------
 // Pinos
 // ----------------------
-#define PIN_PRESENCA   14   // Sensor PIR (digital)
-#define PIN_GAS        34   // Sensor de gás (analógico 0-4095)
+#define PIN_PRESENCA   14
+#define PIN_GAS        34
 #define PIN_LED        26
 #define PIN_BUZZER     27
 
 // ----------------------
-// Parâmetros
+// WiFi / MQTT
 // ----------------------
-const TickType_t SENSOR_PERIOD = pdMS_TO_TICKS(200);   // 200 ms
-const TickType_t ALERT_PERIOD  = pdMS_TO_TICKS(100);   // 100 ms (resposta rápida)
-const TickType_t LOG_PERIOD    = pdMS_TO_TICKS(1000);  // 1 s
+const char* WIFI_SSID = "WAN_FM_VP";
+const char* WIFI_PASS = "fmvp2312";
+
+const char* MQTT_HOST = "broker.hivemq.com";
+const int   MQTT_PORT = 1883;
+
+// Tópicos
+const char* TOPIC_SENSOR = "safetrack/sensor";
+const char* TOPIC_LOG    = "safetrack/log";
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
 
 // ----------------------
-// Estruturas compartilhadas
+// Estruturas e sincronização
 // ----------------------
 typedef struct {
   int gasPPM;
   bool presenca;
-  uint32_t timestampMs;
+  uint32_t timestamp;
 } SensorState_t;
 
-static SensorState_t sharedState;
+SensorState_t sharedState;
 
-// Mutex para proteger sharedState
-static SemaphoreHandle_t stateMutex = NULL;
+SemaphoreHandle_t mutexState;
+SemaphoreHandle_t logQueueSem;
 
-// Optional: notificação para AlertTask (binary semaphore)
-static SemaphoreHandle_t stateReadySem = NULL;
+#define LOG_QUEUE_LEN 10
+String logQueue[LOG_QUEUE_LEN];
+int logWriteIdx = 0;
+int logReadIdx  = 0;
+
+bool pushLog(const String& msg) {
+  int next = (logWriteIdx + 1) % LOG_QUEUE_LEN;
+  if (next == logReadIdx) return false; // fila cheia
+  logQueue[logWriteIdx] = msg;
+  logWriteIdx = next;
+  xSemaphoreGive(logQueueSem);
+  return true;
+}
+
+bool popLog(String& out) {
+  if (logReadIdx == logWriteIdx) return false; // vazia
+  out = logQueue[logReadIdx];
+  logReadIdx = (logReadIdx + 1) % LOG_QUEUE_LEN;
+  return true;
+}
 
 // ----------------------
-// Funções utilitárias
+// Funções auxiliares
 // ----------------------
 int readGasPPM() {
   int raw = analogRead(PIN_GAS);
-  float ppm = (raw / 4095.0f) * 1000.0f; // conversão aproximada
+  float ppm = (raw / 4095.0f) * 1000.0f;
   return (int)ppm;
 }
 
-void applyAlertOutputs(int gasPPM, bool presenca) {
-  if (gasPPM > 400 && presenca) {
+void applyAlert(int gas, bool pres) {
+  if (gas > 400 && pres) {
     digitalWrite(PIN_LED, HIGH);
     tone(PIN_BUZZER, 1000);
   } else {
@@ -52,140 +81,130 @@ void applyAlertOutputs(int gasPPM, bool presenca) {
 }
 
 // ----------------------
-// Tasks
+// Tarefas
 // ----------------------
-void SensorTask(void *pvParameters) {
-  TickType_t lastWake = xTaskGetTickCount();
-
+void WifiTask(void *pv) {
   for (;;) {
-    // Leitura sensores
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      while (WiFi.status() != WL_CONNECTED) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+      }
+      pushLog("WiFi conectado.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+void SensorTask(void *pv) {
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
     bool pres = !digitalRead(PIN_PRESENCA);
-    int gas  = readGasPPM();
+    int gas   = readGasPPM();
     uint32_t ts = millis();
 
-    // Protege e atualiza estado compartilhado
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(20))) {
       sharedState.gasPPM = gas;
       sharedState.presenca = pres;
-      sharedState.timestampMs = ts;
-      xSemaphoreGive(stateMutex);
+      sharedState.timestamp = ts;
+      xSemaphoreGive(mutexState);
     }
-    // Notifica AlertTask que há novo estado
-    xSemaphoreGive(stateReadySem);
 
-    // Periodicidade estável
-    vTaskDelayUntil(&lastWake, SENSOR_PERIOD);
+    pushLog("SensorTask: gas=" + String(gas) + " pres=" + String(pres));
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(200));
   }
-
-  vTaskDelete(NULL);
 }
 
-void AlertTask(void *pvParameters) {
-  // Pode esperar pela notificação ou rodar periodicamente.
+void AlertTask(void *pv) {
   for (;;) {
-    // Espera até ser notificado (timeout para fallback)
-    if (xSemaphoreTake(stateReadySem, ALERT_PERIOD) == pdTRUE) {
-      // Há novo estado — pega mutex para ler
-      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        int gas = sharedState.gasPPM;
-        bool pres = sharedState.presenca;
-        // opcional: uint32_t ts = sharedState.timestampMs;
-        xSemaphoreGive(stateMutex);
-
-        // Decide ação de alerta
-        applyAlertOutputs(gas, pres);
-      }
-    } else {
-      // Timeout — pode checar estado mesmo sem notificação
-      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        int gas = sharedState.gasPPM;
-        bool pres = sharedState.presenca;
-        xSemaphoreGive(stateMutex);
-        applyAlertOutputs(gas, pres);
-      }
-    }
-    // pequena espera para dar chance ao scheduler
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-
-  vTaskDelete(NULL);
-}
-
-void LogTask(void *pvParameters) {
-  TickType_t lastWake = xTaskGetTickCount();
-
-  for (;;) {
-    // Lê estado protegido e escreve no Serial
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(20))) {
       int gas = sharedState.gasPPM;
       bool pres = sharedState.presenca;
-      uint32_t ts = sharedState.timestampMs;
-      xSemaphoreGive(stateMutex);
+      xSemaphoreGive(mutexState);
 
-      Serial.print("[LOG] ");
-      Serial.print("TS=");
-      Serial.print(ts);
-      Serial.print(" ms | Gas=");
-      Serial.print(gas);
-      Serial.print(" ppm | Presenca=");
-      Serial.println(pres ? "SIM" : "NAO");
-    } else {
-      Serial.println("[LOG] falha ao obter mutex.");
+      applyAlert(gas, pres);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void MqttTask(void *pv) {
+  TickType_t last = xTaskGetTickCount();
+
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) {
+      pushLog("MQTT: tentando conectar...");
+      if (mqtt.connect("SafeTrackDevice")) {
+        pushLog("MQTT conectado.");
+      }
     }
 
-    vTaskDelayUntil(&lastWake, LOG_PERIOD);
-  }
+    if (mqtt.connected()) {
+      SensorState_t st;
+      if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(20))) {
+        st = sharedState;
+        xSemaphoreGive(mutexState);
+      }
 
-  vTaskDelete(NULL);
+      String json = "{";
+      json += "\"gas_ppm\": " + String(st.gasPPM) + ",";
+      json += "\"presenca\": " + String(st.presenca ? 1 : 0) + ",";
+      json += "\"timestamp\": " + String(st.timestamp);
+      json += "}";
+
+      mqtt.publish(TOPIC_SENSOR, json.c_str());
+      pushLog("MQTT enviado: " + json);
+
+      mqtt.loop();
+    }
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+  }
+}
+
+void LogTask(void *pv) {
+  for (;;) {
+    if (xSemaphoreTake(logQueueSem, pdMS_TO_TICKS(200))) {
+      String msg;
+      while (popLog(msg)) {
+        Serial.println("[LOG] " + msg);
+
+        if (mqtt.connected()) {
+          mqtt.publish(TOPIC_LOG, msg.c_str());
+        }
+      }
+    }
+  }
 }
 
 // ----------------------
-// Setup e criação de tasks
+// Setup
 // ----------------------
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(200);
 
   pinMode(PIN_PRESENCA, INPUT);
+  pinMode(PIN_GAS, INPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_GAS, INPUT);
 
-  // Inicializa shared state
-  sharedState.gasPPM = 0;
-  sharedState.presenca = false;
-  sharedState.timestampMs = millis();
+  mutexState = xSemaphoreCreateMutex();
+  logQueueSem = xSemaphoreCreateBinary();
 
-  // Cria mutex e semáforo
-  stateMutex = xSemaphoreCreateMutex();
-  stateReadySem = xSemaphoreCreateBinary();
+  WiFi.mode(WIFI_STA);
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
 
-  if (stateMutex == NULL || stateReadySem == NULL) {
-    Serial.println("Erro ao criar mutex/semáforo. Reinicie.");
-    while (1) { delay(1000); }
-  }
+  xTaskCreatePinnedToCore(WifiTask,   "WifiTask",   4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(SensorTask, "SensorTask", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(AlertTask,  "AlertTask",  4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(MqttTask,   "MqttTask",   4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(LogTask,    "LogTask",    4096, NULL, 1, NULL, 0);
 
-  // Limpa semáforo (garantia)
-  xSemaphoreTake(stateReadySem, 0);
-
-  // Cria tasks (pilha e prioridade ajustáveis)
-  BaseType_t ok;
-  ok = xTaskCreatePinnedToCore(
-    SensorTask, "SensorTask", 3072, NULL, 2, NULL, 1);   // core 1 recomendado para sensores
-  if (ok != pdPASS) Serial.println("Falha criar SensorTask");
-
-  ok = xTaskCreatePinnedToCore(
-    AlertTask, "AlertTask", 3072, NULL, 3, NULL, 1);     // prioridade maior para alerta
-  if (ok != pdPASS) Serial.println("Falha criar AlertTask");
-
-  ok = xTaskCreatePinnedToCore(
-    LogTask, "LogTask", 4096, NULL, 1, NULL, 0);         // core 0 para logging/Serial
-  if (ok != pdPASS) Serial.println("Falha criar LogTask");
-
-  Serial.println("Tasks criadas. Sistema FreeRTOS ativo.");
+  pushLog("Sistema iniciado.");
 }
 
 void loop() {
-  // O loop principal pode ficar vazio quando usamos FreeRTOS tasks.
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
